@@ -12,9 +12,10 @@ def python2mirror(file) -> Mirror:
         for line in model:
             line = line.strip()
 
-            if line == "" and current:
-                layers.append(current)
-                current = dict()
+            if line == "":
+                if current:
+                    layers.append(current)
+                    current = dict()
                 continue
             if line.startswith("#"):
                 continue

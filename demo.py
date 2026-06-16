@@ -3,9 +3,9 @@
 Demo: bound propagation and local robustness verification.
 
 Supported models:
-  toy    -- mpri1.py          (2 inputs,   2 outputs, ReLU, hand-crafted)
-  bcw    -- bcw/model.py      (9 inputs,   2 outputs, ReLU, Breast Cancer Wisconsin)
-  mnist  -- mnist-net_256x2.onnx (784 inputs, 10 outputs, ReLU, ONNX)
+  handcrafted -- models/handcrafted/*.py  (hand-crafted nets; pick one with --net, default mpri1)
+  bcw         -- bcw/model.py      (9 inputs,   2 outputs, ReLU, Breast Cancer Wisconsin)
+  mnist       -- mnist-net_256x2.onnx (784 inputs, 10 outputs, ReLU, ONNX)
 
 Supported domains:
   interval  -- Box / Interval domain
@@ -21,9 +21,13 @@ Supported tasks:
 
 Usage examples:
   python demo.py
-  python demo.py --model toy --epsilon 0.2 --domain interval
+  python demo.py --model handcrafted --net mpri3 --epsilon 0.2 --domain interval
   python demo.py --model bcw --row 2 --epsilon 0.05 --task verify
-  python demo.py --model toy --epsilon 0.15 --task compare
+  python demo.py --model handcrafted --epsilon 0.15 --task compare
+  python demo.py --model handcrafted --net mpri4 --input-min -1 --input-max 1
+  python demo.py --model handcrafted --range 0.2 0.8 --task propagate
+  python demo.py --model handcrafted --var-range x00 0.1 0.3 --var-range x01 0.4 0.9 --task propagate
+  python demo.py --model handcrafted --range 0.2 0.8 --point x00 0.3 --task all
 """
 
 import argparse
@@ -67,12 +71,21 @@ def make_domain(name: str, ranges: dict):
 
 # ── model loaders ─────────────────────────────────────────────────────────────
 
-def load_toy():
-    """Toy 2-input network (mpri1.py). Returns (mirror, center_point)."""
-    path = os.path.join(SRC, 'models', 'mpri', 'mpri1.py')
-    mirror = python2mirror(path)
-    center = {'x00': 0.5, 'x01': 0.5}
-    return mirror, center
+def list_handcrafted_nets() -> list:
+    """Base names of every hand-crafted network available in models/handcrafted/."""
+    handcrafted_dir = os.path.join(SRC, 'models', 'handcrafted')
+    return sorted(f[:-3] for f in os.listdir(handcrafted_dir) if f.endswith('.py'))
+
+
+HANDCRAFTED_NETS = list_handcrafted_nets()
+
+
+def load_handcrafted(net: str = 'mpri1'):
+    """Hand-crafted network from models/handcrafted/<net>.py. Returns mirror."""
+    if net not in HANDCRAFTED_NETS:
+        raise ValueError(f"Unknown handcrafted net '{net}'. Choose from: {', '.join(HANDCRAFTED_NETS)}.")
+    path = os.path.join(SRC, 'models', 'handcrafted', f'{net}.py')
+    return python2mirror(path)
 
 
 def load_bcw(row: int = 0):
@@ -114,25 +127,30 @@ def load_mnist(row: int = 0):
     return mirror, center, label
 
 
-def load_model(model_name: str, row: int):
-    """Load a model and return (mirror, center, label_or_None)."""
-    if model_name == 'toy':
-        mirror, center = load_toy()
-        return mirror, center, None
+def load_model(model_name: str, row: int, net: str = 'mpri1'):
+    """Load a model and return (mirror, default_point, label_or_None).
+
+    default_point is None for handcrafted nets (no associated data point; the
+    midpoint of --input-min/--input-max is used as the default in main()), or
+    the loaded data row for bcw/mnist.
+    """
+    if model_name == 'handcrafted':
+        return load_handcrafted(net), None, None
     elif model_name == 'bcw':
         return load_bcw(row)
     elif model_name == 'mnist':
         return load_mnist(row)
     else:
-        raise ValueError(f"Unknown model '{model_name}'. Choose from: toy, bcw, adult, mnist.")
+        raise ValueError(f"Unknown model '{model_name}'. Choose from: handcrafted, bcw, adult, mnist.")
 
 
 # ── input region construction ─────────────────────────────────────────────────
 
-def make_ranges(center: dict, epsilon: float) -> dict:
-    """Build an epsilon-ball (interval) around the center point, clipped to [0, 1]."""
+def make_ranges(center: dict, epsilon: float, input_range: tuple = (0.0, 1.0)) -> dict:
+    """Build an epsilon-ball (interval) around the center point, clipped to input_range."""
+    lo, hi = input_range
     return {
-        var: (max(0.0, v - epsilon), min(1.0, v + epsilon))
+        var: (max(lo, v - epsilon), min(hi, v + epsilon))
         for var, v in center.items()
     }
 
@@ -182,7 +200,7 @@ def print_bounds_summary(mirror, final_state, label=None):
 
 def run_propagate(mirror, ranges: dict, domain_name: str, label=None):
     print_header(f"Bound propagation  [{DOMAIN_LABELS[domain_name]}]")
-    print(f"\n  Input region ({len(ranges)} variables, ε applied):")
+    print(f"\n  Input region ({len(ranges)} variables):")
     for var, (lo, hi) in list(ranges.items())[:6]:
         print(f"    {var}: [{lo:.4f}, {hi:.4f}]")
     if len(ranges) > 6:
@@ -199,20 +217,20 @@ def run_propagate(mirror, ranges: dict, domain_name: str, label=None):
     return found
 
 
-def run_verify(mirror, center: dict, ranges: dict, domain_name: str, label=None):
+def run_verify(mirror, point: dict, ranges: dict, domain_name: str, label=None):
     print_header(f"Local robustness verification  [{DOMAIN_LABELS[domain_name]}]")
 
-    # Determine the postcondition: the class predicted at the center point
-    point_ranges = {var: (v, v) for var, v in center.items()}
+    # Determine the postcondition: the class predicted at the reference point
+    point_ranges = {var: (v, v) for var, v in point.items()}
     point_initial = make_domain(domain_name, point_ranges)
     _, _, _, point_pred = bound(mirror, point_initial)
 
     if point_pred in ('?', '⊥'):
-        print(f"\n  Cannot determine prediction at center point ({point_pred}). Aborting.")
+        print(f"\n  Cannot determine prediction at the reference point ({point_pred}). Aborting.")
         return
 
     postcondition = mirror.outputs.index(point_pred)
-    print(f"\n  Center-point prediction: class {postcondition} ({point_pred})", end="")
+    print(f"\n  Reference-point prediction: class {postcondition} ({point_pred})", end="")
     if label is not None:
         match = " (correct)" if postcondition == label else " (WRONG)"
         print(match, end="")
@@ -270,34 +288,79 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument('--model',   default='toy',
-                        choices=['toy', 'bcw', 'adult', 'mnist'],
-                        help="Neural network to analyse (default: toy)")
+    parser.add_argument('--model',   default='handcrafted',
+                        choices=['handcrafted', 'bcw', 'adult', 'mnist'],
+                        help="Neural network to analyse (default: handcrafted)")
+    parser.add_argument('--net',     default='mpri1',
+                        choices=HANDCRAFTED_NETS,
+                        help=f"Hand-crafted network from models/handcrafted/ to use when "
+                             f"--model handcrafted (default: mpri1). "
+                             f"Available: {', '.join(HANDCRAFTED_NETS)}")
+    parser.add_argument('--input-min', type=float, default=0.0,
+                        help="Lower bound of the default input range for handcrafted models "
+                             "(default: 0.0). Used for --epsilon/verify, and as the propagate/"
+                             "compare range unless --range/--var-range is given.")
+    parser.add_argument('--input-max', type=float, default=1.0,
+                        help="Upper bound of the default input range for handcrafted models "
+                             "(default: 1.0). Used for --epsilon/verify, and as the propagate/"
+                             "compare range unless --range/--var-range is given.")
+    parser.add_argument('--range', nargs=2, type=float, metavar=('LO', 'HI'), default=None,
+                        help="Directly set the same [LO, HI] input range for every variable, "
+                        "for propagate/compare (handcrafted models only). Bypasses "
+                        "--input-min/--input-max for those tasks.")
+    parser.add_argument('--var-range', nargs=3, metavar=('NAME', 'LO', 'HI'), action='append',
+                        dest='var_ranges', default=[],
+                        help="Override the propagate/compare input range for a single named "
+                        "variable (repeatable, handcrafted models only), "
+                        "e.g. --var-range x00 0.1 0.3.")
+    parser.add_argument('--point', nargs=2, metavar=('NAME', 'VALUE'), action='append',
+                        dest='points', default=[],
+                        help="Override the value of a named input variable at the reference "
+                        "point used for --epsilon / verify (repeatable), e.g. --point x00 0.3. "
+                        "Defaults to the center of the input range (or the loaded data row "
+                        "for bcw/mnist).")
     parser.add_argument('--domain',  default='deeppoly',
                         choices=list(DOMAINS.keys()),
                         help="Abstract domain to use (default: deeppoly)")
     parser.add_argument('--epsilon', type=float, default=0.1,
-                        help="Perturbation radius around the center point (default: 0.1)")
+                        help="Perturbation radius around the reference point (default: 0.1)")
     parser.add_argument('--row',     type=int,   default=0,
                         help="Row index in the test CSV (for bcw/adult/mnist, default: 0)")
     parser.add_argument('--task',    default='all',
                         choices=['propagate', 'verify', 'compare', 'all'],
                         help="Task to run (default: all = propagate + verify)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.input_min >= args.input_max:
+        parser.error("--input-min must be smaller than --input-max")
+    if args.range is not None and args.range[0] >= args.range[1]:
+        parser.error("--range LO must be smaller than HI")
+    var_ranges = []
+    for name, lo_s, hi_s in args.var_ranges:
+        lo, hi = float(lo_s), float(hi_s)
+        if lo >= hi:
+            parser.error(f"--var-range {name}: LO must be smaller than HI")
+        var_ranges.append((name, lo, hi))
+    args.var_ranges = var_ranges
+    args.points = [(name, float(value)) for name, value in args.points]
+    return args
 
 
 def main():
     args = parse_args()
+    explicit_ranges = args.model == 'handcrafted' and (args.range is not None or args.var_ranges)
 
     print(f"\nModel:    {args.model}")
+    if args.model == 'handcrafted':
+        print(f"Net:      {args.net}")
+        print(f"Input range: [{args.input_min}, {args.input_max}]")
     print(f"Domain:   {DOMAIN_LABELS[args.domain]}")
     print(f"Epsilon:  {args.epsilon}")
-    if args.model != 'toy':
+    if args.model != 'handcrafted':
         print(f"Row:      {args.row}")
     print(f"Task:     {args.task}")
 
     # Load model and data
-    mirror, center, label = load_model(args.model, args.row)
+    mirror, default_point, label = load_model(args.model, args.row, args.net)
 
     print(f"\nNetwork:  {len(mirror.inputs)} inputs, "
           f"{len(mirror.outputs)} outputs, "
@@ -306,14 +369,43 @@ def main():
     if label is not None:
         print(f"Label:    {label}")
 
-    ranges = make_ranges(center, args.epsilon)
+    bounds = (args.input_min, args.input_max) if args.model == 'handcrafted' else (0.0, 1.0)
+    if default_point is None:
+        lo, hi = bounds
+        default_point = {var: (lo + hi) / 2.0 for var in mirror.inputs}
+
+    # The reference point for --epsilon / verify: --point overrides, else the default center
+    point = dict(default_point)
+    for name, value in args.points:
+        if name not in mirror.inputs:
+            raise ValueError(f"Unknown input variable '{name}' for --point. "
+                              f"Network inputs: {', '.join(mirror.inputs)}.")
+        point[name] = value
+    verify_ranges = make_ranges(point, args.epsilon, bounds)
+
+    # Ranges for propagate/compare. For handcrafted models, this is the full [input-min,
+    # input-max] box by default, or --range/--var-range if given. bcw/mnist have no such
+    # "full box" notion, so they keep using the epsilon-ball around the loaded data point.
+    if args.model == 'handcrafted':
+        if explicit_ranges:
+            base = tuple(args.range) if args.range is not None else bounds
+            ranges = {var: base for var in mirror.inputs}
+            for name, lo, hi in args.var_ranges:
+                if name not in mirror.inputs:
+                    raise ValueError(f"Unknown input variable '{name}' for --var-range. "
+                                      f"Network inputs: {', '.join(mirror.inputs)}.")
+                ranges[name] = (lo, hi)
+        else:
+            ranges = {var: bounds for var in mirror.inputs}
+    else:
+        ranges = verify_ranges
 
     # Dispatch tasks
     if args.task in ('propagate', 'all'):
         run_propagate(mirror, ranges, args.domain, label)
 
     if args.task in ('verify', 'all'):
-        run_verify(mirror, center, ranges, args.domain, label)
+        run_verify(mirror, point, verify_ranges, args.domain, label)
 
     if args.task == 'compare':
         run_compare(mirror, ranges, label)
